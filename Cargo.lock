@@ -1340,6 +1340,7 @@ dependencies = [
  "hyper",
  "moka",
  "parking_lot",
+ "pem",
  "rcgen",
  "rustls",
  "rustls-pki-types",

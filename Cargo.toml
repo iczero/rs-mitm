@@ -12,6 +12,8 @@ fjall = "2.6.2"
 hyper = { version = "1.6.0", features = ["full"] }
 moka = { version = "0.12.10", features = ["future"] }
 parking_lot = "0.12.3"
+pem = "3.0.4"
+# update this back to crates.io when the CertificateParams::signed_by change is released
 rcgen = { git = "https://github.com/rustls/rcgen", rev = "3f482d9664c4f550a3fa317bcd6174b87c41cb88", features = ["x509-parser"] }
 rustls = "0.23.22"
 rustls-pki-types = { version = "1.11.0", features = ["std"] }

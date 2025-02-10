@@ -5,7 +5,19 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use time::{Duration, OffsetDateTime};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-pub fn make_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+/// Represents a CA capable of signing certificates
+pub struct SigningCA {
+    /// CA certificate
+    pub cert: CertificateDer<'static>,
+    /// CA private key
+    pub key: PrivateKeyDer<'static>,
+    /// `rcgen` certificate parameters used for signing
+    pub ca_signing_params: CertificateParams,
+    /// `rcgen` keypair used for signing
+    pub ca_signing_key: KeyPair,
+}
+
+pub fn make_ca() -> SigningCA {
     let mut params = CertificateParams::new(vec![]).unwrap();
     params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
     params.not_after = OffsetDateTime::now_utc() + Duration::days(365 * 3);
@@ -21,17 +33,26 @@ pub fn make_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
     dn.push(DnType::OrganizationalUnitName, "Network Services");
     dn.push(DnType::CommonName, "Decryption CA");
 
-    let keypair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+    let keypair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("failed to generate ECC P-256 keypair");
     let certificate = params
         .self_signed(&keypair)
         .expect("failed to sign certificate");
-    (certificate, keypair)
+
+    SigningCA {
+        cert: certificate.der().clone(),
+        key: PrivateKeyDer::try_from(keypair.serialized_der())
+            .unwrap()
+            .clone_key(),
+        ca_signing_params: certificate.params().clone(),
+        ca_signing_key: keypair,
+    }
 }
 
-pub fn load_ca_pem(cert_pem: &[u8], key_pem: &[u8]) -> eyre::Result<(CertificateParams, KeyPair)> {
-    let cert_der =
-        CertificateDer::from_pem_slice(cert_pem).wrap_err("failed to parse CA certificate file")?;
+pub fn load_ca_pem(cert_pem: &[u8], key_pem: &[u8]) -> eyre::Result<SigningCA> {
+    let cert_der = CertificateDer::from_pem_slice(cert_pem)
+        .wrap_err("failed to parse CA certificate file")?
+        .into_owned();
     let (_, cert_parsed) =
         X509Certificate::from_der(&cert_der).wrap_err("failed to parse CA certificate file")?;
     let sig_alg_oid: Vec<u64> = cert_parsed
@@ -44,8 +65,16 @@ pub fn load_ca_pem(cert_pem: &[u8], key_pem: &[u8]) -> eyre::Result<(Certificate
         rcgen::SignatureAlgorithm::from_oid(&sig_alg_oid).wrap_err("unknown signature type")?;
     let cert_params =
         CertificateParams::from_ca_cert_der(&cert_der).wrap_err("failed to load CA certificate")?;
-    let key_der = PrivateKeyDer::from_pem_slice(key_pem).wrap_err("failed to parse CA key file")?;
+    let key_der = PrivateKeyDer::from_pem_slice(key_pem)
+        .wrap_err("failed to parse CA key file")?
+        .clone_key();
     let keypair =
         KeyPair::from_der_and_sign_algo(&key_der, sig_alg).wrap_err("failed to load CA key")?;
-    Ok((cert_params, keypair))
+
+    Ok(SigningCA {
+        cert: cert_der,
+        key: key_der,
+        ca_signing_params: cert_params,
+        ca_signing_key: keypair,
+    })
 }
