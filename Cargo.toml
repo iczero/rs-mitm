@@ -1,0 +1,24 @@
+[package]
+name = "rs-mitm"
+description = "spy on yourself"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.28", features = ["derive"] }
+color-eyre = "0.6.3"
+eyre = "0.6.12"
+fjall = "2.6.2"
+hyper = { version = "1.6.0", features = ["full"] }
+moka = { version = "0.12.10", features = ["future"] }
+parking_lot = "0.12.3"
+rcgen = { git = "https://github.com/rustls/rcgen", rev = "3f482d9664c4f550a3fa317bcd6174b87c41cb88", features = ["x509-parser"] }
+rustls = "0.23.22"
+rustls-pki-types = { version = "1.11.0", features = ["std"] }
+time = { version = "0.3.37", features = ["macros", "formatting", "parsing"] }
+tokio = { version = "1.43.0", features = ["full", "tracing"] }
+tokio-rustls = "0.26.1"
+tracing = "0.1.41"
+tracing-error = "0.2.1"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+x509-parser = "0.17.0"
