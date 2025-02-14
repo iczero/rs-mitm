@@ -1,7 +1,6 @@
 use eyre::Context;
-use rcgen::{CertificateParams, KeyPair};
-use rs_mitm::certgen::SigningCA;
-use rs_mitm::{certgen, common};
+use rs_mitm::ca::SigningCA;
+use rs_mitm::common;
 use tokio::fs;
 use tracing::info;
 
@@ -11,7 +10,28 @@ async fn main() -> eyre::Result<()> {
     info!("Hello, world!");
 
     let ca = load_or_create_ca().await?;
+    let pair = ca.create_cert_for_names(vec![rcgen::SanType::DnsName(
+        std::env::args()
+            .nth(1)
+            .expect("no arg")
+            .try_into()
+            .expect("bad name"),
+    )]);
+    fs::write(
+        "data/test-cert.pem",
+        pem_encode("CERTIFICATE", pair.certificate_chain[0].to_vec()),
+    )
+    .await?;
+    fs::write(
+        "data/test-key.pem",
+        pem_encode("PRIVATE KEY", pair.key.secret_der().to_vec()),
+    )
+    .await?;
     Ok(())
+}
+
+fn pem_encode(tag: impl ToString, contents: Vec<u8>) -> String {
+    pem::encode(&pem::Pem::new(tag, contents))
 }
 
 async fn load_or_create_ca() -> eyre::Result<SigningCA> {
@@ -19,16 +39,20 @@ async fn load_or_create_ca() -> eyre::Result<SigningCA> {
         tokio::try_join!(fs::read("data/ca-cert.pem"), fs::read("data/ca-key.pem"))
     {
         let out =
-            certgen::load_ca_pem(&cert_pem, &key_pem).wrap_err("parsing CA certificate/key")?;
+            SigningCA::load_ca_pem(&cert_pem, &key_pem).wrap_err("parsing CA certificate/key")?;
         info!("loaded CA certificate");
         Ok(out)
     } else {
-        let signing_ca = certgen::make_ca();
-        let cert_pem = pem::Pem::new("CERTIFICATE", signing_ca.cert.to_vec());
-        let key_pem = pem::Pem::new("PRIVATE KEY", signing_ca.key.secret_der().to_vec());
+        let signing_ca = SigningCA::make_ca();
         tokio::try_join!(
-            fs::write("data/ca-cert.pem", pem::encode(&cert_pem)),
-            fs::write("data/ca-key.pem", pem::encode(&key_pem)),
+            fs::write(
+                "data/ca-cert.pem",
+                pem_encode("CERTIFICATE", signing_ca.cert.to_vec())
+            ),
+            fs::write(
+                "data/ca-key.pem",
+                pem_encode("PRIVATE KEY", signing_ca.key.secret_der().to_vec())
+            ),
         )
         .wrap_err("writing CA certificate")?;
         info!("created CA certificate");
