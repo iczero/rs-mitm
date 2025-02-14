@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_channel::{Receiver, Sender};
-use parking_lot::RwLock;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::{self, JoinHandle, JoinSet};
 
@@ -54,10 +53,13 @@ pub struct PoolWorkerHandle {
     pub control_send: Sender<PoolWorkerControl>,
 }
 
-// TODO:
 pub enum PoolManagerControl {
-    Drain(oneshot::Receiver<()>),
-    Exit { graceful: bool },
+    /// Exit idle workers
+    Drain,
+    /// Cancel all jobs and exit
+    Abort,
+    /// Stop accepting requests, then exit when all jobs are complete
+    ExitGracefully,
 }
 
 pub enum PoolManagerEvent {
@@ -97,19 +99,18 @@ pub struct PoolWorkerManager {
 pub enum WorkerExitConfirmation {
     /// The worker will exit immediately and the manager should join on it
     WillExit,
-    /// The worker will not exit because it is busy
+    /// The worker declined to exit
     WillNotExit,
 }
 
 /// Control messages sent to pool workers
 pub enum PoolWorkerControl {
-    /// Request that this worker exit
-    RequestExit {
-        confirm: oneshot::Receiver<WorkerExitConfirmation>,
-        /// Instruct worker to cancel all pending jobs and exit immediately.
-        /// If this is set, WillNotExit should not be returned.
-        force: bool,
-    },
+    /// Request that this worker exit if it is idle
+    ExitIfIdle(oneshot::Receiver<WorkerExitConfirmation>),
+    /// Request that this worker cancel all pending jobs and exit immediately
+    Abort,
+    /// Stop accepting requests and exit once all jobs are done
+    ExitGracefully,
     /// Next worker exited and this worker is now at the top of the stack
     NextWorkerExited,
     /// Next worker added, this worker is no longer at the top of the stack
