@@ -1,123 +1,192 @@
-//! Stack-structured connection pools
+//! Connection pool
 
-// approximate idea
-// one pool per host (probably IP address)
-// http/2 connections work as usual
-// a http/1 "entry" is actually "up to n" (where n is probably 10) connections
-// in a trenchcoat
-// timeouts or something
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Weak};
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use async_channel::Sender;
+use intrusive_collections::{
+    KeyAdapter, LinkedList, LinkedListAtomicLink, RBTree, RBTreeAtomicLink, UnsafeRef,
+    intrusive_adapter,
+};
 
-use async_channel::{Receiver, Sender};
-use tokio::sync::{Notify, oneshot};
-use tokio::task::{self, JoinHandle, JoinSet};
+pub trait PoolRequest {}
 
-pub struct RequestObjectPlaceholder;
-
-pub struct Pool {
-    request_queue_send: Sender<RequestObjectPlaceholder>,
-    request_queue_recv: Receiver<RequestObjectPlaceholder>,
-    manager_control_send: Sender<PoolManagerControl>,
-    manager_events_recv: Receiver<PoolManagerEvent>,
-    shared: Arc<PoolSharedState>,
-    /// Whether the worker manager has budget to spawn another worker
-    can_spawn_worker: Arc<AtomicBool>,
-    /// Asks worker manager to spawn another worker if queues are full
-    complain_button: Arc<Notify>,
-    worker_manager: JoinHandle<()>,
+pub enum PoolManagerMessage<T: PoolRequest> {
+    WorkerAvailable(Weak<PoolWorkerShared<T>>),
+    WorkerShutdown(Weak<PoolWorkerShared<T>>),
 }
 
-impl Pool {
-    pub fn queue_full(&self) {
-        if self.can_spawn_worker.load(Ordering::Relaxed) {
-            self.complain_button.notify_one();
+pub enum PoolWorkerMessage<T: PoolRequest> {
+    Request(T),
+    NotifyOnAvailable(Sender<PoolManagerMessage<T>>),
+}
+
+pub struct PoolWorkerShared<T: PoolRequest> {
+    pub send: Sender<PoolWorkerMessage<T>>,
+    pub remaining_capacity: AtomicUsize,
+}
+
+pub struct PoolWorker<T: PoolRequest> {
+    shared: Arc<PoolWorkerShared<T>>,
+    available_notify: Vec<Sender<PoolManagerMessage<T>>>,
+    shutdown_notify: Vec<Sender<PoolManagerMessage<T>>>,
+}
+
+pub struct WorkerEntry<T: PoolRequest> {
+    worker_shared: Arc<PoolWorkerShared<T>>,
+    list_link: LinkedListAtomicLink,
+    tree_link: RBTreeAtomicLink,
+}
+
+impl<T: PoolRequest> WorkerEntry<T> {
+    pub fn new(shared: Arc<PoolWorkerShared<T>>) -> Self {
+        Self {
+            worker_shared: shared,
+            list_link: LinkedListAtomicLink::new(),
+            tree_link: RBTreeAtomicLink::new(),
         }
     }
 }
 
-pub struct PoolSharedState {
-    /// Total number of in-progress requests (including queued and active)
-    pub outstanding_requests: AtomicUsize,
-    /// Current active workers count (not necessarily up to date)
-    pub workers_count: AtomicUsize,
-    /// Total number of requests received
-    pub requests_received: AtomicUsize,
-    /// Total number of requests completed
-    pub requests_completed: AtomicUsize,
+intrusive_adapter! {
+    WorkerEntryListAdapter<T> = UnsafeRef<WorkerEntry<T>>:
+        WorkerEntry<T> { list_link: LinkedListAtomicLink }
+    where T: PoolRequest
 }
 
-pub struct PoolWorkerHandle {
-    pub join_handle: JoinHandle<()>,
-    pub control_send: Sender<PoolWorkerControl>,
+intrusive_adapter! {
+    WorkerEntryTreeAdapter<T> = UnsafeRef<WorkerEntry<T>>:
+        WorkerEntry<T> { list_link: RBTreeAtomicLink }
+    where T: PoolRequest
 }
 
-pub enum PoolManagerControl {
-    /// Exit idle workers
-    Drain,
-    /// Cancel all jobs and exit
-    Abort,
-    /// Stop accepting requests, then exit when all jobs are complete
-    ExitGracefully,
+impl<'a, T: PoolRequest> KeyAdapter<'a> for WorkerEntryTreeAdapter<T> {
+    type Key = *const PoolWorkerShared<T>;
+
+    fn get_key(
+        &self,
+        value: &'a <Self::PointerOps as intrusive_collections::PointerOps>::Value,
+    ) -> Self::Key {
+        Arc::as_ptr(&value.worker_shared)
+    }
 }
 
-pub enum PoolManagerEvent {
-    /// All workers exited
-    PoolEmpty,
-    /// Pool manager worker is about to exit
-    Exiting,
+pub trait ArcIntoPtr<T> {
+    fn into_ptr(this: &Self) -> *const T;
 }
 
-pub struct PoolWorkerManager {
-    workers: JoinSet<()>,
-    max_workers: usize,
-    request_queue_send: Sender<RequestObjectPlaceholder>,
-    request_queue_recv: Receiver<RequestObjectPlaceholder>,
-    shared: Arc<PoolSharedState>,
-    manager_events_send: Sender<PoolManagerEvent>,
-    control_recv: Receiver<PoolManagerControl>,
-    /// Wakes worker manager to check if it needs to spawn another worker
-    complaint_notifier: Arc<Notify>,
-    /// Controls whether queue full notifications will be sent to the manager
-    can_spawn_worker: Arc<AtomicBool>,
-    /// Worker stack
-    worker_stack: Vec<PoolWorkerHandle>,
-    /// Receiver for worker exit requests (due to inactivity timeout)
-    worker_exit_request_recv: Receiver<task::Id>,
-    // worker exit: worker requests exit (inactivity timeout), manager sends exit request,
-    // worker either accepts, in which case manager joins it and pops it off
-    // the stack if it's the last (it should almost always be the last except in
-    // exceptional cases like panics) and notifies the next worker that its
-    // successor exited. if the worker does not accept, the manager continues.
-    //
-    // if there are no more workers, the pool may still hang around; in that
-    // case, the manager should listen on the request queue and spawn a
-    // worker and then re-queue the request
+impl<T> ArcIntoPtr<T> for Arc<T> {
+    fn into_ptr(this: &Self) -> *const T {
+        Arc::as_ptr(this)
+    }
 }
 
-pub enum WorkerExitConfirmation {
-    /// The worker will exit immediately and the manager should join on it
-    WillExit,
-    /// The worker declined to exit
-    WillNotExit,
+impl<T> ArcIntoPtr<T> for Weak<T> {
+    fn into_ptr(this: &Self) -> *const T {
+        Weak::as_ptr(this)
+    }
 }
 
-/// Control messages sent to pool workers
-pub enum PoolWorkerControl {
-    /// Request that this worker exit if it is idle
-    ExitIfIdle(oneshot::Receiver<WorkerExitConfirmation>),
-    /// Request that this worker cancel all pending jobs and exit immediately
-    Abort,
-    /// Stop accepting requests and exit once all jobs are done
-    ExitGracefully,
-    /// Next worker exited and this worker is now at the top of the stack
-    NextWorkerExited,
-    /// Next worker added, this worker is no longer at the top of the stack
-    NextWorkerCreated,
+// "front" is considered the "top" of the stack
+pub struct AvailabilityList<T: PoolRequest> {
+    list: LinkedList<WorkerEntryListAdapter<T>>,
+    tree: RBTree<WorkerEntryTreeAdapter<T>>,
 }
 
-/// Task for
-pub struct PoolWorker {
-    // prev: notify
+unsafe fn hybrid_remove_entry_by_list_cursor<T: PoolRequest>(
+    cursor: &mut intrusive_collections::linked_list::CursorMut<'_, WorkerEntryListAdapter<T>>,
+    tree: &mut RBTree<WorkerEntryTreeAdapter<T>>,
+) -> Option<Arc<PoolWorkerShared<T>>> {
+    let ptr = cursor.remove()?;
+    // safety: elements must reside in both structures
+    debug_assert!(ptr.tree_link.is_linked());
+    let mut cursor = unsafe { tree.cursor_mut_from_ptr(ptr.as_ref()) };
+    cursor.remove().expect("invalid state");
+    // safety: there must only be two of these and we already dropped the second one
+    let shared = unsafe { UnsafeRef::into_box(ptr).worker_shared };
+    Some(shared)
+}
+
+unsafe fn hybrid_remove_entry_by_tree_cursor<T: PoolRequest>(
+    cursor: &mut intrusive_collections::rbtree::CursorMut<'_, WorkerEntryTreeAdapter<T>>,
+    list: &mut LinkedList<WorkerEntryListAdapter<T>>,
+) -> Option<Arc<PoolWorkerShared<T>>> {
+    let ptr = cursor.remove()?;
+    // safety: elements must reside in both structures
+    debug_assert!(ptr.tree_link.is_linked());
+    let mut cursor = unsafe { list.cursor_mut_from_ptr(ptr.as_ref()) };
+    cursor.remove().expect("invalid state");
+    // safety: there must only be two of these and we already dropped the second one
+    let shared = unsafe { UnsafeRef::into_box(ptr).worker_shared };
+    Some(shared)
+}
+
+impl<T: PoolRequest> AvailabilityList<T> {
+    pub fn push_front(&mut self, shared: Arc<PoolWorkerShared<T>>) {
+        let entry = Box::new(WorkerEntry::new(shared));
+        let ptr = UnsafeRef::from_box(entry);
+        self.tree.insert(ptr.clone());
+        self.list.push_front(ptr);
+    }
+
+    pub fn push_back(&mut self, shared: Arc<PoolWorkerShared<T>>) {
+        let entry = Box::new(WorkerEntry::new(shared));
+        let ptr = UnsafeRef::from_box(entry);
+        self.tree.insert(ptr.clone());
+        self.list.push_back(ptr);
+    }
+
+    pub fn pop_front(&mut self) -> Option<Arc<PoolWorkerShared<T>>> {
+        let mut cursor = self.list.front_mut();
+        unsafe { hybrid_remove_entry_by_list_cursor(&mut cursor, &mut self.tree) }
+    }
+
+    pub fn pop_back(&mut self) -> Option<Arc<PoolWorkerShared<T>>> {
+        let mut cursor = self.list.back_mut();
+        unsafe { hybrid_remove_entry_by_list_cursor(&mut cursor, &mut self.tree) }
+    }
+
+    pub fn remove_by_key(
+        &mut self,
+        what: impl ArcIntoPtr<PoolWorkerShared<T>>,
+    ) -> Option<Arc<PoolWorkerShared<T>>> {
+        let mut cursor = self.tree.find_mut(&ArcIntoPtr::into_ptr(&what));
+        unsafe { hybrid_remove_entry_by_tree_cursor(&mut cursor, &mut self.list) }
+    }
+
+    pub fn very_limited_cursor_front(&mut self) -> VeryLimitedCursor<'_, T> {
+        VeryLimitedCursor {
+            list_cursor: self.list.front_mut(),
+            tree: &mut self.tree,
+        }
+    }
+}
+
+pub struct VeryLimitedCursor<'a, T: PoolRequest> {
+    list_cursor: intrusive_collections::linked_list::CursorMut<'a, WorkerEntryListAdapter<T>>,
+    tree: &'a mut RBTree<WorkerEntryTreeAdapter<T>>,
+}
+
+impl<T: PoolRequest> VeryLimitedCursor<'_, T> {
+    pub fn get(&mut self) -> Option<&PoolWorkerShared<T>> {
+        self.list_cursor.get().map(|v| v.worker_shared.as_ref())
+    }
+
+    /// removes the current element, then moves the cursor to the next element
+    pub fn remove(&mut self) -> Option<Arc<PoolWorkerShared<T>>> {
+        unsafe { hybrid_remove_entry_by_list_cursor(&mut self.list_cursor, self.tree) }
+    }
+
+    pub fn next(&mut self) {
+        self.list_cursor.move_next();
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.list_cursor.is_null()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    // TODO:
 }
