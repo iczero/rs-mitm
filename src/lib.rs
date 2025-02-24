@@ -1,3 +1,4 @@
+pub mod avail_list;
 pub mod ca;
 pub mod common;
 pub mod pool;
